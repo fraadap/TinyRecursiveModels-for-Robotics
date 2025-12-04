@@ -16,98 +16,13 @@ sys.modules["matplotlib.ticker"] = mock_mpl
 sys.modules["matplotlib._path"] = mock_mpl
 
 # %%
-# # Install compatible versions to avoid the "API version 0x10" error
-# !pip uninstall -y numpy
-# !pip install "numpy>=1.24,<2.0"
-# !pip install robosuite libero
-# # Force a restart of the python process after install
-# import os
-# os.kill(os.getpid(), 9)
-
-# %%
-# # 1. Install the correct NumPy version to fix the "0x10 vs 0xf" error
-# !pip uninstall -y numpy
-# !pip install "numpy>=1.24,<2.0" 
-
-# # 2. Re-install Robosuite/Libero to ensure they link to the new NumPy
-# !pip install robosuite libero
-
-# print("✅ INSTALLATION DONE. NOW PLEASE RESTART THE KERNEL.")
-# print("Menu -> Run -> Restart Kernel (or the circular arrow icon)")
-
-# %%
-!git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
-
-# %%
-# !pip install "numpy>=1.24,<2.0"
-
-# %%
-!pip install matplotlib
-!pip install tokenizers==0.15.2
-!pip install optuna
-
-# %%
-!pip install -r <(grep -v -e "matplotlib" -e "tokenizers" /kaggle/working/LIBERO/requirements.txt) --no-deps
-
-# %%
-!echo n | python /kaggle/working/LIBERO/benchmark_scripts/download_libero_datasets.py --datasets libero_spatial --use-huggingface > /dev/null 2>&1
-
-# %%
-!mkdir /kaggle/working/dataset | mv /kaggle/working/LIBERO/libero/datasets/* /kaggle/working/dataset
-
-# %%
-# import h5py
-# import matplotlib.pyplot as plt
-# import torch.multiprocessing as mp
-
-
-# file_path = "/kaggle/working/dataset/libero_spatial/pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate_demo.hdf5"
-
-# def print_hdf5_contents(name, obj):
-#     """
-#     Stampa nome, tipo e forma di ogni elemento HDF5
-#     """
-#     if isinstance(obj, h5py.Dataset):
-#         print(f"Dataset: {name}, shape: {obj.shape}, dtype: {obj.dtype}")
-#     elif isinstance(obj, h5py.Group):
-#         print(f"Group: {name}")
-
-# '''with h5py.File(file_path, "r") as f:
-#     f.visititems(print_hdf5_contents)'''
-
-# file_path = "/kaggle/working/dataset/libero_spatial/pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate_demo.hdf5"
-
-# with h5py.File(file_path, "r") as f:
-#     # Cicla su tutti i demo presenti
-#     for demo_name in f["data"]:
-#         print(f"Demo: {demo_name}")
-#         images = f[f"data/{demo_name}/obs/agentview_rgb"]
-#         num_images = images.shape[0]
-        
-#         # Prendi immagini ogni 15 timestep
-#         indices = list(range(0, num_images, 15))
-        
-#         # Assicurati che l'ultima immagine sia inclusa
-#         if num_images - 1 not in indices:
-#             indices.append(num_images - 1)
-        
-#         fig, axes = plt.subplots(1, len(indices), figsize=(15, 3))
-        
-#         for ax, idx in zip(axes, indices):
-#             ax.imshow(images[idx])
-#             ax.axis('off')
-#             ax.set_title(f"Timestep {idx}")
-        
-#         plt.show()
-
-# %%
 import h5py
 import numpy as np
 from PIL import Image
 from IPython.display import display, HTML
 
 # Path to your demo file
-file_path = "/kaggle/working/dataset/libero_spatial/pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate_demo.hdf5"
+file_path = "dataset/libero_spatial/pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate_demo.hdf5"
 
 print(f"Opening file: {file_path}")
 
@@ -143,7 +58,7 @@ try:
                     
                     # Hack to display inline in loop
                     print(f"Frame {idx}:")
-                    display(img)
+                    #display(img)
             else:
                 print(f"Skipping {demo_name}: 'obs/agentview_rgb' not found.")
                 
@@ -152,28 +67,6 @@ except Exception as e:
 
 # %% [markdown]
 # # Libraries
-
-# %%
-!pip install mujoco==2.3.7
-!pip install --force-reinstall numba==0.56.4 llvmlite==0.39.0
-
-# %%
-# Installa Einops: Indispensabile per manipolare tensori (reshape, permute)
-# in modo leggibile dentro il tuo blocco ricorsivo.
-!pip install einops
-
-# Installa WandB (Weights & Biases): Standard de-facto per tracciare
-# i grafici di loss e accuracy durante il training.
-!pip install wandb
-
-# Installa Transformers: Servirà per scaricare CLIP o BERT
-# quando dovrai creare gli embedding del linguaggio (per LIBERO-Goal).
-!pip install transformers
-
-# Installa Robomimic (Opzionale ma consigliato):
-# Contiene molte utility per processare i file HDF5 di robosuite/libero
-# senza dover riscrivere tutto da zero.
-!pip install robomimic
 
 # %%
 import torch
@@ -219,7 +112,7 @@ import h5py
 from pathlib import Path
 import cv2
 from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass, asdict, replace
+from dataclasses import dataclass, asdict, replace, field
 import json
 import wandb
 import optuna
@@ -250,6 +143,7 @@ class TrainingConfig:
     lr: float = 3e-4
     hidden_dim: int = 256
     num_recursions: int = 8
+    num_slots: int = 4
     epochs: int = 20
     batch_size: int = 64
     weight_decay: float = 1e-4
@@ -288,6 +182,10 @@ class HyperparameterSearchSpace:
     freeze_backbone: List[bool]
     augmentation: List[bool]
     dropout: List[float]
+    text_encoder_name: List[str]
+    train_text_encoder: List[bool]
+    text_dropout: List[float]
+    num_slots: List[int] = field(default_factory=lambda: [4])
 
     def as_optuna_space(self) -> Dict[str, List[Any]]:
         return {
@@ -300,6 +198,10 @@ class HyperparameterSearchSpace:
             'freeze_backbone': self.freeze_backbone,
             'augmentation': self.augmentation,
             'dropout': self.dropout,
+            'text_encoder_name': self.text_encoder_name,
+            'train_text_encoder': self.train_text_encoder,
+            'text_dropout': self.text_dropout,
+            'num_slots': self.num_slots,
         }
 
 # Numero 1
@@ -316,6 +218,13 @@ def default_search_space() -> HyperparameterSearchSpace:
         freeze_backbone=[False],
         augmentation=[True, False],
         dropout=[0.1, 0.3, 0.5, 0.7],
+        text_encoder_name=[
+            'openai/clip-vit-base-patch32',
+            'openai/clip-vit-large-patch14'
+        ],
+        train_text_encoder=[False, True],
+        text_dropout=[0.05, 0.1, 0.2, 0.3],
+        num_slots=[4, 6, 8]
     )
 #Numero 2
 '''
@@ -536,7 +445,7 @@ def explore_libero_dataset(data_path: Path):
     return hdf5_files
 
 # Esegui
-hdf5_files = explore_libero_dataset(Path('/kaggle/working/dataset/libero_spatial'))
+hdf5_files = explore_libero_dataset(Path('dataset/libero_spatial'))
 
 # %%
 class LIBERODataset(Dataset):
@@ -1085,25 +994,28 @@ class PromptEncoder(nn.Module):
 
 
 class RecursiveBlock(nn.Module):
-    """
-    Blocco ricorsivo del TRM.
-    Implementa il ragionamento iterativo con self-attention e MLP.
-    """
-    
+    """Slot-based TRM block with cross- then self-attention updates."""
+
     def __init__(self, hidden_dim=256, num_heads=4, dropout=0.1):
         super().__init__()
-        
-        # Self-attention per ragionamento
-        self.attention = nn.MultiheadAttention(
+
+        self.cross_attn = nn.MultiheadAttention(
             hidden_dim,
             num_heads,
             dropout=dropout,
             batch_first=True
         )
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.dropout1 = nn.Dropout(dropout)
-        
-        # MLP per trasformazione
+        self.self_attn = nn.MultiheadAttention(
+            hidden_dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.slot_norm = nn.LayerNorm(hidden_dim)
+        self.cond_norm = nn.LayerNorm(hidden_dim)
+        self.self_attn_norm = nn.LayerNorm(hidden_dim)
+        self.mlp_norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
@@ -1111,50 +1023,48 @@ class RecursiveBlock(nn.Module):
             nn.Linear(hidden_dim * 4, hidden_dim),
             nn.Dropout(dropout)
         )
-        self.norm2 = nn.LayerNorm(hidden_dim)
-    
-    def forward(self, h, x_cond):
+        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
+
+    def forward(self, slots: torch.Tensor, cond_tokens: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            h: (B, D) hidden state corrente
-            x_cond: (B, D) conditioning dall'input
+            slots: tensor (B, S, D) con gli slot correnti.
+            cond_tokens: tensor (B, T, D) con i token di condizionamento.
         Returns:
-            (B, D) nuovo hidden state
+            slots aggiornati (B, S, D).
         """
-        # Combina hidden state e conditioning
-        combined = h + x_cond
-        combined = combined.unsqueeze(1)  # (B, 1, D) per attention
-        
-        # Self-attention con residual
-        attn_out, _ = self.attention(combined, combined, combined)
-        combined = self.norm1(combined + self.dropout1(attn_out))
-        
-        # MLP con residual
-        mlp_out = self.mlp(combined)
-        h_new = self.norm2(combined + mlp_out)
-        
-        return h_new.squeeze(1)  # (B, D)
+        bsz, num_slots, dim = slots.shape
+
+        # Cross-attention: gli slot interrogano i token (visivi/testuali).
+        slots_norm = self.slot_norm(slots)
+        cond_norm = self.cond_norm(cond_tokens)
+        cross_out, _ = self.cross_attn(slots_norm, cond_norm, cond_norm)
+        gru_input = cross_out.reshape(-1, dim)
+        prev_slots = slots.reshape(-1, dim)
+        slots = self.gru(gru_input, prev_slots).view(bsz, num_slots, dim)
+
+        # Self-attention tra slot per coordinare le ipotesi.
+        attn_in = self.self_attn_norm(slots)
+        self_out, _ = self.self_attn(attn_in, attn_in, attn_in)
+        slots = slots + self.dropout(self_out)
+
+        # MLP residua per raffinamento.
+        mlp_out = self.mlp(self.mlp_norm(slots))
+        slots = slots + self.dropout(mlp_out)
+        return slots
 
 
 class TRMPolicy(nn.Module):
-    """
-    Policy completa basata su TinyRecursiveModels per controllo robotico.
-    
-    Architettura:
-    1. Visual Encoder: CNN (custom o ResNet pre-trained) per estrarre features da immagini
-    2. Recursive Block: applicato N volte per ragionamento iterativo
-    3. Action Head: predice azioni da ultimo hidden state
-    
-    NOTA: Aspetta input in formato PyTorch standard (B, C, H, W)
-    """
-    
+    """Policy TRM con slot-attention e fusione vision-language compatibile con la letteratura."""
+
     def __init__(
         self,
-        obs_shape=(3, 128, 128),  # Formato CHW (PyTorch standard)
+        obs_shape=(3, 128, 128),
         action_dim=7,
         hidden_dim=256,
         num_heads=4,
         num_recursions=8,
+        num_slots=4,
         dropout=0.1,
         adaptive_halt=False,
         use_pretrained_encoder=True,
@@ -1166,15 +1076,13 @@ class TRMPolicy(nn.Module):
         text_dropout=0.1
     ):
         super().__init__()
-        
+
         self.hidden_dim = hidden_dim
         self.num_recursions = num_recursions
+        self.num_slots = num_slots
         self.adaptive_halt = adaptive_halt
-        self.obs_shape = obs_shape
-        self.use_pretrained_encoder = use_pretrained_encoder
         self.use_text_prompts = use_text_prompts
-        
-        # Selezione encoder
+
         if use_pretrained_encoder:
             self.encoder = PretrainedVisualEncoder(
                 hidden_dim=hidden_dim,
@@ -1187,7 +1095,7 @@ class TRMPolicy(nn.Module):
                 hidden_dim=hidden_dim,
                 dropout=encoder_dropout
             )
-        
+
         if self.use_text_prompts:
             self.prompt_encoder = PromptEncoder(
                 hidden_dim=hidden_dim,
@@ -1195,21 +1103,34 @@ class TRMPolicy(nn.Module):
                 trainable=train_text_encoder,
                 dropout=text_dropout
             )
-            fusion_in = hidden_dim * 2
-            self.fusion_adapter = nn.Sequential(
-                nn.LayerNorm(fusion_in),
-                nn.Linear(fusion_in, hidden_dim),
+            self.text_token_adapter = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout)
             )
         else:
             self.prompt_encoder = None
-            self.fusion_adapter = None
+            self.text_token_adapter = None
 
-        # Recursive block
+        self.vision_token_adapter = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
+        self.slot_init = nn.Parameter(torch.randn(num_slots, hidden_dim))
+        self.slot_conditioning = nn.Linear(hidden_dim, hidden_dim)
+        self.slot_readout = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
         self.recursive_block = RecursiveBlock(hidden_dim, num_heads, dropout)
-        
-        # Action head
+
         self.action_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
@@ -1217,8 +1138,7 @@ class TRMPolicy(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, action_dim)
         )
-        
-        # Adaptive halting (opzionale)
+
         if adaptive_halt:
             self.halt_predictor = nn.Sequential(
                 nn.Linear(hidden_dim, 64),
@@ -1226,76 +1146,91 @@ class TRMPolicy(nn.Module):
                 nn.Linear(64, 1),
                 nn.Sigmoid()
             )
-    
-    def forward(self, obs, prompts: Optional[List[str]] = None, return_all_states=False):
-        """
-        Args:
-            obs: (B, C, H, W) osservazioni in formato CHW (PyTorch standard)
-            prompts: lista di stringhe (B) con la descrizione del task
-            return_all_states: se True, restituisce tutti gli hidden states
-        Returns:
-            actions: (B, action_dim) azioni predette
-            (opzionale) states: lista di hidden states
-        """
+
+    def forward(self, obs, prompts: Optional[List[str]] = None, return_all_states: bool = False):
         B = obs.shape[0]
-        
-        # Encoding iniziale
-        x_cond = self.encoder(obs)
+        device = obs.device
+
+        vision_token = self.vision_token_adapter(self.encoder(obs)).unsqueeze(1)
+        cond_tokens = [vision_token]
 
         if self.use_text_prompts:
             if prompts is None:
                 raise ValueError("TRMPolicy richiede i prompt testuali quando use_text_prompts=True")
-            text_features = self.prompt_encoder(prompts, device=obs.device)
-            x_cond = self.fusion_adapter(torch.cat([x_cond, text_features], dim=-1))
+            text_features = self.prompt_encoder(prompts, device=device)
+            text_token = self.text_token_adapter(text_features).unsqueeze(1)
+            cond_tokens.append(text_token)
 
-        h = x_cond.clone()
-        
-        states = [h] if return_all_states else None
-        
-        # Applicazione ricorsiva del blocco
+        cond_tokens = torch.cat(cond_tokens, dim=1)
+        cond_summary = cond_tokens.mean(dim=1)
+        slots = self._init_slots(B, device, cond_summary)
+
+        state_trace: Optional[List[torch.Tensor]] = [] if return_all_states else None
+        if return_all_states and state_trace is not None:
+            state_trace.append(self.slot_readout(slots.mean(dim=1)))
+
         if self.adaptive_halt:
-            h, halt_info = self._forward_adaptive(h, x_cond, B)
+            pooled, halt_info, adaptive_states = self._forward_adaptive(
+                slots,
+                cond_tokens,
+                B,
+                track_states=return_all_states
+            )
+            if return_all_states and adaptive_states and state_trace is not None:
+                state_trace.extend(self.slot_readout(state) for state in adaptive_states)
         else:
-            for t in range(self.num_recursions):
-                h = self.recursive_block(h, x_cond)
-                if return_all_states:
-                    states.append(h)
-        
-        # Predizione azione
-        actions = self.action_head(h)
-        
-        if return_all_states:
-            return actions, states
+            for _ in range(self.num_recursions):
+                slots = self.recursive_block(slots, cond_tokens)
+                if return_all_states and state_trace is not None:
+                    state_trace.append(self.slot_readout(slots.mean(dim=1)))
+            pooled = slots.mean(dim=1)
+
+        pooled = self.slot_readout(pooled)
+        actions = self.action_head(pooled)
+
+        if return_all_states and state_trace is not None:
+            return actions, state_trace
         return actions
-    
-    def _forward_adaptive(self, h, x_cond, B):
-        """Adaptive Computation Time (ACT)"""
+
+    def _forward_adaptive(self, slots, cond_tokens, batch_size, track_states: bool = False):
+        """Adaptive Computation Time applicato agli slot."""
         halt_probs = []
-        remainders = torch.ones(B, device=h.device)
-        n_updates = torch.zeros(B, device=h.device)
-        accumulated_h = torch.zeros_like(h)
-        
-        for t in range(self.num_recursions):
-            h = self.recursive_block(h, x_cond)
-            
-            halt_p = self.halt_predictor(h).squeeze(-1)
+        remainders = torch.ones(batch_size, device=slots.device)
+        n_updates = torch.zeros(batch_size, device=slots.device)
+        accumulated = torch.zeros(batch_size, slots.size(-1), device=slots.device)
+        state_trace: Optional[List[torch.Tensor]] = [] if track_states else None
+
+        for _ in range(self.num_recursions):
+            slots = self.recursive_block(slots, cond_tokens)
+            pooled = slots.mean(dim=1)
+
+            if track_states and state_trace is not None:
+                state_trace.append(pooled.detach().clone())
+
+            halt_p = self.halt_predictor(pooled).squeeze(-1)
             halt_probs.append(halt_p)
-            
+
             still_running = (remainders > 0.01).float()
-            accumulated_h += remainders.unsqueeze(-1) * h * still_running.unsqueeze(-1)
-            
+            accumulated += remainders.unsqueeze(-1) * pooled * still_running.unsqueeze(-1)
             remainders = remainders * (1 - halt_p) * still_running
             n_updates += still_running
-            
+
             if remainders.max() < 0.01:
                 break
-        
+
         halt_info = {
             'halt_probs': halt_probs,
             'n_updates': n_updates
         }
-        
-        return accumulated_h, halt_info
+
+        if track_states:
+            return accumulated, halt_info, state_trace or []
+        return accumulated, halt_info, None
+
+    def _init_slots(self, batch_size: int, device: torch.device, cond_summary: torch.Tensor) -> torch.Tensor:
+        base = self.slot_init.unsqueeze(0).expand(batch_size, -1, -1).to(device)
+        cond_bias = self.slot_conditioning(cond_summary).unsqueeze(1)
+        return base + cond_bias
 
 
 def build_policy_from_config(config: TrainingConfig, obs_shape: Tuple[int, int, int] = (3, 128, 128)) -> TRMPolicy:
@@ -1306,6 +1241,7 @@ def build_policy_from_config(config: TrainingConfig, obs_shape: Tuple[int, int, 
         action_dim=7,
         hidden_dim=config.hidden_dim,
         num_recursions=config.num_recursions,
+        num_slots=config.num_slots,
         dropout=config.dropout,
         use_pretrained_encoder=config.use_pretrained_encoder,
         freeze_backbone=config.freeze_backbone,
@@ -1614,9 +1550,18 @@ def optuna_random_search(
             augmentation=trial.suggest_categorical('augmentation', search_space.augmentation),
             dropout=trial.suggest_categorical('dropout', search_space.dropout),
             encoder_dropout=trial.suggest_categorical('dropout', search_space.dropout),
+            text_encoder_name=trial.suggest_categorical('text_encoder_name', search_space.text_encoder_name),
+            train_text_encoder=trial.suggest_categorical('train_text_encoder', search_space.train_text_encoder),
+            text_dropout=trial.suggest_categorical('text_dropout', search_space.text_dropout),
+            num_slots=trial.suggest_categorical('num_slots', search_space.num_slots),
             grad_clip=1.0,
             save_path=f"optuna_trial_{trial.number}.pt"
         )
+
+        print("-" * 80)
+        print(f"[Optuna] Trial {trial.number + 1}/{n_trials}")
+        print(json.dumps(trial_config.to_dict(), indent=2))
+        sys.stdout.flush()
 
         # Build dataloaders based on this trial's batch size
         train_loader, val_loader = build_dataloaders(
@@ -1963,8 +1908,8 @@ def generate_evaluation_report(results_dict, output_path):
 
 # %%
 def main_pipeline(
-    data_path: str = '/kaggle/working/dataset/libero_spatial',
-    work_dir: str = '/kaggle/working/trm_robotics',
+    data_path: str = 'dataset/libero_spatial',
+    work_dir: str = 'trm_robotics',
     quick_search: bool = True,
     train_final: bool = True,
     use_custom_final_config: bool = False,
@@ -2079,6 +2024,7 @@ def main_pipeline(
     # ========== STEP 2: Hyperparameter Search ==========
     best_config = None
     
+    quick_search = False
     if quick_search:
         print(f"\n{'='*80}")
         print("STEP 2: Hyperparameter Search")
@@ -2108,17 +2054,22 @@ def main_pipeline(
         
         if best_config is None or use_custom_final_config:
             best_config = TrainingConfig(
-                lr=3e-4,
-                hidden_dim=256,
-                num_recursions=8,
-                batch_size=32,
-                epochs=100,
-                weight_decay=1e-4,
+                lr=1e-4,
+                hidden_dim=128,
+                num_recursions=12,
+                batch_size=256,
+                epochs=20,
+                weight_decay=1.0,
                 dropout=0.3,
                 encoder_dropout=0.1,
                 use_pretrained_encoder=True,
                 freeze_backbone=False,
-                augmentation=False
+                augmentation=True,
+                text_encoder_name='openai/clip-vit-large-patch14',
+                train_text_encoder = False,
+                text_dropout = 0.1,
+                use_text_prompts = True,
+                num_slots = 4
             )
             print("⚠️  Usando configurazione custom di default")
 
@@ -2151,7 +2102,8 @@ def main_pipeline(
                     obs_shape=(3, 128, 128),
                     action_dim=7,
                     hidden_dim=256,
-                    num_recursions=8
+                    num_recursions=8,
+                    num_slots=4
                 )
 
             trained_model.load_state_dict(checkpoint['model_state_dict'])
@@ -2198,24 +2150,14 @@ def main_pipeline(
     print("  - hyperparam_results.json: risultati hyperparameter search")
 
 # %%
-"""Setup model with Optuna best params (trial 26), validate then train."""
+
+
+# %%
+"""Esegue Optuna HPO (incluso il text-encoder) e avvia il training finale."""
 import torch
 
-data_path =  '/kaggle/working/dataset/libero_spatial'
-work_dir = '/kaggle/working/trm_robotics'
-
-# Optuna best parameters from your message
-best_params = {
-    'lr': 1e-4,
-    'hidden_dim': 128,
-    'num_recursions': 12,
-    'batch_size': 256,
-    'weight_decay': 1.0,
-    'use_pretrained_encoder': True,
-    'freeze_backbone': False,
-    'augmentation': True,
-    'dropout': 0.3,
-}
+data_path = 'dataset/libero_spatial'
+work_dir = 'trm_robotics'
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"✓ Using device: {device}\n")
@@ -2225,50 +2167,43 @@ print(f"\n{'='*80}")
 print("STEP 1: Caricamento Dataset")
 print(f"{'='*80}")
 
-# Trova file HDF5
 data_path = Path(data_path)
 hdf5_files = list(data_path.glob('**/*.hdf5'))
 
 if not hdf5_files:
-    print(f"❌ Nessun file HDF5 trovato in {data_path}")
-    print("Assicurati di aver scaricato il dataset LIBERO!")
+    raise RuntimeError(f"❌ Nessun file HDF5 trovato in {data_path}. Scarica prima il dataset LIBERO.")
 
 print(f"✓ Trovati {len(hdf5_files)} file HDF5 (task)")
 
-# Demo-level split: usa TUTTI i file per entrambi i dataset
-# ma dividi le demo all'interno di ciascun file (80% train, 20% val)
 demo_split_ratio = 0.8
 print(f"\n📊 Demo-level split: {demo_split_ratio:.0%} train / {1-demo_split_ratio:.0%} val per ogni task")
 print(f"   Tutti i {len(hdf5_files)} task presenti in entrambi train e val")
 
-# Crea datasets con demo-level split
 print("\nCreating TRAIN dataset...")
 train_dataset = LIBERODataset(
-    hdf5_files,  # Usa TUTTI i file
+    hdf5_files,
     sequence_length=1,
     image_size=(128, 128),
     augmentation=False,
-    max_demos_per_task=50,  # Limita per velocità
+    max_demos_per_task=50,
     demo_split_ratio=demo_split_ratio,
-    is_train=True  # Prime 80% demo per task
+    is_train=True
 )
 
-# Usa le stesse statistiche del training set per la validation
 train_action_stats = train_dataset.action_stats
 
 print("\nCreating VAL dataset...")
 val_dataset = LIBERODataset(
-    hdf5_files,  # Usa TUTTI i file
+    hdf5_files,
     sequence_length=1,
     image_size=(128, 128),
     augmentation=False,
-    max_demos_per_task=50,  # Stesso limite per coerenza
+    max_demos_per_task=50,
     demo_split_ratio=demo_split_ratio,
-    is_train=False,  # Ultime 20% demo per task
-    action_stats=train_action_stats  # Usa statistiche del training
+    is_train=False,
+    action_stats=train_action_stats
 )
 
-# Data loader template (verranno istanziati on-demand)
 num_workers = min(4, os.cpu_count() or 1)
 use_cuda = torch.cuda.is_available()
 
@@ -2284,7 +2219,6 @@ print(f"\n✓ Dataset creati con demo-level split")
 print(f"  Train samples: {len(train_dataset)}")
 print(f"  Val samples: {len(val_dataset)}")
 
-# Salva action stats per denormalizzazione
 action_stats = train_dataset.action_stats
 with open('action_stats.json', 'w') as f:
     json.dump({
@@ -2292,46 +2226,50 @@ with open('action_stats.json', 'w') as f:
         'std': action_stats['std'].tolist()
     }, f)
 
-# Build TrainingConfig (adjust epochs as desired)
-config = TrainingConfig(
-    lr=best_params['lr'],
-    hidden_dim=best_params['hidden_dim'],
-    num_recursions=best_params['num_recursions'],
-    epochs=5,                       # change if you want longer training
-    batch_size=best_params['batch_size'],
-    weight_decay=best_params['weight_decay'],
-    use_pretrained_encoder=best_params['use_pretrained_encoder'],
-    freeze_backbone=best_params['freeze_backbone'],
-    augmentation=best_params['augmentation'],
-    dropout=best_params['dropout'],
-    encoder_dropout=best_params['dropout'],
-    save_path='best_trial_26.pt'
+# ========== STEP 2: Hyperparameter Search con Optuna ==========
+search_trials = 20
+quick_epochs = 5
+print(f"\n{'='*80}")
+print(f"STEP 2: Optuna search ({search_trials} trials, {quick_epochs} quick epochs)")
+print(f"{'='*80}")
+
+best_config, search_history = optuna_random_search(
+    train_dataset,
+    val_dataset,
+    loader_common,
+    device,
+    quick_epochs=quick_epochs,
+    search_space=default_search_space(),
+    n_trials=search_trials
 )
 
-# Device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+with open('hyperparam_results.json', 'w') as f:
+    json.dump(search_history, f, indent=2)
 
-# Retrieve datasets and loader kwargs from notebook namespace (created earlier)
-train_dataset = globals().get('train_dataset')
-val_dataset = globals().get('val_dataset')
-loader_common = globals().get('loader_common', {'num_workers': 0, 'pin_memory': False, 'persistent_workers': False})
+with open('best_hyperparams.json', 'w') as f:
+    json.dump(best_config.to_dict(), f, indent=2)
 
-if train_dataset is None or val_dataset is None:
-    raise RuntimeError("train_dataset or val_dataset not found. Run the dataset preparation cells before this cell.")
+print("\n✅ Optuna search completata. Miglior configurazione:")
+print(best_config.to_dict())
 
-# Build dataloaders, model and trainer
-train_loader, val_loader = build_dataloaders(train_dataset, val_dataset, config.batch_size, loader_common)
-model = build_policy_from_config(config, obs_shape=(3, 128, 128)).to(device)
-trainer = BehaviorCloningTrainer(model, train_loader, val_loader, config, device, use_wandb=False)
+# ========== STEP 3: Training con la miglior configurazione ==========
+final_config = replace(
+    best_config,
+    epochs=10,
+    save_path='optuna_best.pt'
+)
 
-# Initial validation (before training) and training
-print('Running initial validation...')
+train_loader, val_loader = build_dataloaders(train_dataset, val_dataset, final_config.batch_size, loader_common)
+model = build_policy_from_config(final_config, obs_shape=(3, 128, 128)).to(device)
+trainer = BehaviorCloningTrainer(model, train_loader, val_loader, final_config, device, use_wandb=False)
+
+print('\nRunning validation before training...')
 val_metrics = trainer._validate_epoch(0)
 print(f"Initial validation loss: {val_metrics['loss']:.4f}")
 
-print('Starting training...')
+print('Starting final training with Optuna config...')
 best_val = trainer.train()
 print(f"Training finished. Best validation loss saved: {best_val:.4f}")
-print(f"Checkpoint saved to: {config.save_path}")
+print(f"Checkpoint saved to: {final_config.save_path}")
 
 
