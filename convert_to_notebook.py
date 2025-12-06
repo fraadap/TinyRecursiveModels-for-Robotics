@@ -202,7 +202,7 @@ def convert_py_to_notebook(input_path: str, output_path: str):
 
 def main():
     """Main function"""    
-    input_path = "TinyRecursiveModels-for-Robotics\\notebook.py"
+    input_path = "notebook.py"
     output_path = (Path(input_path).with_suffix('.ipynb'))
     try:
         convert_py_to_notebook(input_path, output_path)
