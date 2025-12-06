@@ -112,7 +112,7 @@ import h5py
 from pathlib import Path
 import cv2
 from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass, asdict, replace, field
+from dataclasses import dataclass, asdict, replace
 import json
 import wandb
 import optuna
@@ -143,7 +143,6 @@ class TrainingConfig:
     lr: float = 3e-4
     hidden_dim: int = 256
     num_recursions: int = 8
-    num_slots: int = 4
     epochs: int = 20
     batch_size: int = 64
     weight_decay: float = 1e-4
@@ -185,7 +184,6 @@ class HyperparameterSearchSpace:
     text_encoder_name: List[str]
     train_text_encoder: List[bool]
     text_dropout: List[float]
-    num_slots: List[int] = field(default_factory=lambda: [4])
 
     def as_optuna_space(self) -> Dict[str, List[Any]]:
         return {
@@ -201,7 +199,6 @@ class HyperparameterSearchSpace:
             'text_encoder_name': self.text_encoder_name,
             'train_text_encoder': self.train_text_encoder,
             'text_dropout': self.text_dropout,
-            'num_slots': self.num_slots,
         }
 
 # Numero 1
@@ -209,22 +206,21 @@ def default_search_space() -> HyperparameterSearchSpace:
     """Restituisce lo spazio di ricerca richiesto dall'utente."""
 
     return HyperparameterSearchSpace(
-        lr=[1e-5, 1e-6, 1e-4, 1e-3],
+        lr=[1e-5, 1e-6, 1e-4],
         hidden_dim=[128, 256, 512],
         num_recursions=[8, 12, 16],
-        batch_size=[32, 64, 128, 256, 512],
+        batch_size=[128, 256, 512, 768],
         weight_decay=[0.1, 0.5, 1.0],
         pretrained_encoder=[False],
         freeze_backbone=[False],
-        augmentation=[True, False],
-        dropout=[0.1, 0.3, 0.5, 0.7],
+        augmentation=[True],
+        dropout=[0.1, 0.3, 0.5],
         text_encoder_name=[
             'openai/clip-vit-base-patch32',
             'openai/clip-vit-large-patch14'
         ],
         train_text_encoder=[False, True],
         text_dropout=[0.05, 0.1, 0.2, 0.3],
-        num_slots=[4, 6, 8]
     )
 #Numero 2
 '''
@@ -941,7 +937,7 @@ class PromptEncoder(nn.Module):
         hidden_dim: int,
         model_name: str = 'openai/clip-vit-large-patch14',
         trainable: bool = False,
-        dropout: float = 0.1,
+        dropout: float = 0.3,
         max_length: int = 77
     ):
         super().__init__()
@@ -979,7 +975,7 @@ class PromptEncoder(nn.Module):
         return {k: v.clone() for k, v in cached.items()}
 
     def forward(self, prompts: List[str], device: torch.device) -> torch.Tensor:
-        if not prompts:
+        if len(prompts) == 0:
             raise ValueError("PromptEncoder received an empty batch of prompts")
 
         token_batches = [self._tokenize(p) for p in prompts]
@@ -994,28 +990,25 @@ class PromptEncoder(nn.Module):
 
 
 class RecursiveBlock(nn.Module):
-    """Slot-based TRM block with cross- then self-attention updates."""
-
+    """
+    Blocco ricorsivo del TRM.
+    Implementa il ragionamento iterativo con self-attention e MLP.
+    """
+    
     def __init__(self, hidden_dim=256, num_heads=4, dropout=0.1):
         super().__init__()
-
-        self.cross_attn = nn.MultiheadAttention(
+        
+        # Self-attention per ragionamento
+        self.attention = nn.MultiheadAttention(
             hidden_dim,
             num_heads,
             dropout=dropout,
             batch_first=True
         )
-        self.self_attn = nn.MultiheadAttention(
-            hidden_dim,
-            num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.slot_norm = nn.LayerNorm(hidden_dim)
-        self.cond_norm = nn.LayerNorm(hidden_dim)
-        self.self_attn_norm = nn.LayerNorm(hidden_dim)
-        self.mlp_norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.dropout1 = nn.Dropout(dropout)
+        
+        # MLP per trasformazione
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
@@ -1023,48 +1016,50 @@ class RecursiveBlock(nn.Module):
             nn.Linear(hidden_dim * 4, hidden_dim),
             nn.Dropout(dropout)
         )
-        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
-
-    def forward(self, slots: torch.Tensor, cond_tokens: torch.Tensor) -> torch.Tensor:
+        self.norm2 = nn.LayerNorm(hidden_dim)
+    
+    def forward(self, h, x_cond):
         """
         Args:
-            slots: tensor (B, S, D) con gli slot correnti.
-            cond_tokens: tensor (B, T, D) con i token di condizionamento.
+            h: (B, D) hidden state corrente
+            x_cond: (B, D) conditioning dall'input
         Returns:
-            slots aggiornati (B, S, D).
+            (B, D) nuovo hidden state
         """
-        bsz, num_slots, dim = slots.shape
-
-        # Cross-attention: gli slot interrogano i token (visivi/testuali).
-        slots_norm = self.slot_norm(slots)
-        cond_norm = self.cond_norm(cond_tokens)
-        cross_out, _ = self.cross_attn(slots_norm, cond_norm, cond_norm)
-        gru_input = cross_out.reshape(-1, dim)
-        prev_slots = slots.reshape(-1, dim)
-        slots = self.gru(gru_input, prev_slots).view(bsz, num_slots, dim)
-
-        # Self-attention tra slot per coordinare le ipotesi.
-        attn_in = self.self_attn_norm(slots)
-        self_out, _ = self.self_attn(attn_in, attn_in, attn_in)
-        slots = slots + self.dropout(self_out)
-
-        # MLP residua per raffinamento.
-        mlp_out = self.mlp(self.mlp_norm(slots))
-        slots = slots + self.dropout(mlp_out)
-        return slots
+        # Combina hidden state e conditioning
+        combined = h + x_cond
+        combined = combined.unsqueeze(1)  # (B, 1, D) per attention
+        
+        # Self-attention con residual
+        attn_out, _ = self.attention(combined, combined, combined)
+        combined = self.norm1(combined + self.dropout1(attn_out))
+        
+        # MLP con residual
+        mlp_out = self.mlp(combined)
+        h_new = self.norm2(combined + mlp_out)
+        
+        return h_new.squeeze(1)  # (B, D)
 
 
 class TRMPolicy(nn.Module):
-    """Policy TRM con slot-attention e fusione vision-language compatibile con la letteratura."""
-
+    """
+    Policy completa basata su TinyRecursiveModels per controllo robotico.
+    
+    Architettura:
+    1. Visual Encoder: CNN (custom o ResNet pre-trained) per estrarre features da immagini
+    2. Recursive Block: applicato N volte per ragionamento iterativo
+    3. Action Head: predice azioni da ultimo hidden state
+    
+    NOTA: Aspetta input in formato PyTorch standard (B, C, H, W)
+    """
+    
     def __init__(
         self,
-        obs_shape=(3, 128, 128),
+        obs_shape=(3, 128, 128),  # Formato CHW (PyTorch standard)
         action_dim=7,
         hidden_dim=256,
         num_heads=4,
         num_recursions=8,
-        num_slots=4,
         dropout=0.1,
         adaptive_halt=False,
         use_pretrained_encoder=True,
@@ -1076,13 +1071,15 @@ class TRMPolicy(nn.Module):
         text_dropout=0.1
     ):
         super().__init__()
-
+        
         self.hidden_dim = hidden_dim
         self.num_recursions = num_recursions
-        self.num_slots = num_slots
         self.adaptive_halt = adaptive_halt
+        self.obs_shape = obs_shape
+        self.use_pretrained_encoder = use_pretrained_encoder
         self.use_text_prompts = use_text_prompts
-
+        
+        # Selezione encoder
         if use_pretrained_encoder:
             self.encoder = PretrainedVisualEncoder(
                 hidden_dim=hidden_dim,
@@ -1095,7 +1092,7 @@ class TRMPolicy(nn.Module):
                 hidden_dim=hidden_dim,
                 dropout=encoder_dropout
             )
-
+        
         if self.use_text_prompts:
             self.prompt_encoder = PromptEncoder(
                 hidden_dim=hidden_dim,
@@ -1103,34 +1100,21 @@ class TRMPolicy(nn.Module):
                 trainable=train_text_encoder,
                 dropout=text_dropout
             )
-            self.text_token_adapter = nn.Sequential(
-                nn.LayerNorm(hidden_dim),
-                nn.Linear(hidden_dim, hidden_dim),
+            fusion_in = hidden_dim * 2
+            self.fusion_adapter = nn.Sequential(
+                nn.LayerNorm(fusion_in),
+                nn.Linear(fusion_in, hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout)
             )
         else:
             self.prompt_encoder = None
-            self.text_token_adapter = None
+            self.fusion_adapter = None
 
-        self.vision_token_adapter = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-
-        self.slot_init = nn.Parameter(torch.randn(num_slots, hidden_dim))
-        self.slot_conditioning = nn.Linear(hidden_dim, hidden_dim)
-        self.slot_readout = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-
+        # Recursive block
         self.recursive_block = RecursiveBlock(hidden_dim, num_heads, dropout)
-
+        
+        # Action head
         self.action_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
@@ -1138,7 +1122,8 @@ class TRMPolicy(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, action_dim)
         )
-
+        
+        # Adaptive halting (opzionale)
         if adaptive_halt:
             self.halt_predictor = nn.Sequential(
                 nn.Linear(hidden_dim, 64),
@@ -1146,91 +1131,76 @@ class TRMPolicy(nn.Module):
                 nn.Linear(64, 1),
                 nn.Sigmoid()
             )
-
-    def forward(self, obs, prompts: Optional[List[str]] = None, return_all_states: bool = False):
+    
+    def forward(self, obs, prompts: Optional[List[str]] = None, return_all_states=False):
+        """
+        Args:
+            obs: (B, C, H, W) osservazioni in formato CHW (PyTorch standard)
+            prompts: lista di stringhe (B) con la descrizione del task
+            return_all_states: se True, restituisce tutti gli hidden states
+        Returns:
+            actions: (B, action_dim) azioni predette
+            (opzionale) states: lista di hidden states
+        """
         B = obs.shape[0]
-        device = obs.device
-
-        vision_token = self.vision_token_adapter(self.encoder(obs)).unsqueeze(1)
-        cond_tokens = [vision_token]
+        
+        # Encoding iniziale
+        x_cond = self.encoder(obs)
 
         if self.use_text_prompts:
             if prompts is None:
                 raise ValueError("TRMPolicy richiede i prompt testuali quando use_text_prompts=True")
-            text_features = self.prompt_encoder(prompts, device=device)
-            text_token = self.text_token_adapter(text_features).unsqueeze(1)
-            cond_tokens.append(text_token)
+            text_features = self.prompt_encoder(prompts, device=obs.device)
+            x_cond = self.fusion_adapter(torch.cat([x_cond, text_features], dim=-1))
 
-        cond_tokens = torch.cat(cond_tokens, dim=1)
-        cond_summary = cond_tokens.mean(dim=1)
-        slots = self._init_slots(B, device, cond_summary)
-
-        state_trace: Optional[List[torch.Tensor]] = [] if return_all_states else None
-        if return_all_states and state_trace is not None:
-            state_trace.append(self.slot_readout(slots.mean(dim=1)))
-
+        h = x_cond.clone()
+        
+        states = [h] if return_all_states else None
+        
+        # Applicazione ricorsiva del blocco
         if self.adaptive_halt:
-            pooled, halt_info, adaptive_states = self._forward_adaptive(
-                slots,
-                cond_tokens,
-                B,
-                track_states=return_all_states
-            )
-            if return_all_states and adaptive_states and state_trace is not None:
-                state_trace.extend(self.slot_readout(state) for state in adaptive_states)
+            h, halt_info = self._forward_adaptive(h, x_cond, B)
         else:
-            for _ in range(self.num_recursions):
-                slots = self.recursive_block(slots, cond_tokens)
-                if return_all_states and state_trace is not None:
-                    state_trace.append(self.slot_readout(slots.mean(dim=1)))
-            pooled = slots.mean(dim=1)
-
-        pooled = self.slot_readout(pooled)
-        actions = self.action_head(pooled)
-
-        if return_all_states and state_trace is not None:
-            return actions, state_trace
+            for t in range(self.num_recursions):
+                h = self.recursive_block(h, x_cond)
+                if return_all_states:
+                    states.append(h)
+        
+        # Predizione azione
+        actions = self.action_head(h)
+        
+        if return_all_states:
+            return actions, states
         return actions
-
-    def _forward_adaptive(self, slots, cond_tokens, batch_size, track_states: bool = False):
-        """Adaptive Computation Time applicato agli slot."""
+    
+    def _forward_adaptive(self, h, x_cond, B):
+        """Adaptive Computation Time (ACT)"""
         halt_probs = []
-        remainders = torch.ones(batch_size, device=slots.device)
-        n_updates = torch.zeros(batch_size, device=slots.device)
-        accumulated = torch.zeros(batch_size, slots.size(-1), device=slots.device)
-        state_trace: Optional[List[torch.Tensor]] = [] if track_states else None
-
-        for _ in range(self.num_recursions):
-            slots = self.recursive_block(slots, cond_tokens)
-            pooled = slots.mean(dim=1)
-
-            if track_states and state_trace is not None:
-                state_trace.append(pooled.detach().clone())
-
-            halt_p = self.halt_predictor(pooled).squeeze(-1)
+        remainders = torch.ones(B, device=h.device)
+        n_updates = torch.zeros(B, device=h.device)
+        accumulated_h = torch.zeros_like(h)
+        
+        for t in range(self.num_recursions):
+            h = self.recursive_block(h, x_cond)
+            
+            halt_p = self.halt_predictor(h).squeeze(-1)
             halt_probs.append(halt_p)
-
+            
             still_running = (remainders > 0.01).float()
-            accumulated += remainders.unsqueeze(-1) * pooled * still_running.unsqueeze(-1)
+            accumulated_h += remainders.unsqueeze(-1) * h * still_running.unsqueeze(-1)
+            
             remainders = remainders * (1 - halt_p) * still_running
             n_updates += still_running
-
+            
             if remainders.max() < 0.01:
                 break
-
+        
         halt_info = {
             'halt_probs': halt_probs,
             'n_updates': n_updates
         }
-
-        if track_states:
-            return accumulated, halt_info, state_trace or []
-        return accumulated, halt_info, None
-
-    def _init_slots(self, batch_size: int, device: torch.device, cond_summary: torch.Tensor) -> torch.Tensor:
-        base = self.slot_init.unsqueeze(0).expand(batch_size, -1, -1).to(device)
-        cond_bias = self.slot_conditioning(cond_summary).unsqueeze(1)
-        return base + cond_bias
+        
+        return accumulated_h, halt_info
 
 
 def build_policy_from_config(config: TrainingConfig, obs_shape: Tuple[int, int, int] = (3, 128, 128)) -> TRMPolicy:
@@ -1241,7 +1211,6 @@ def build_policy_from_config(config: TrainingConfig, obs_shape: Tuple[int, int, 
         action_dim=7,
         hidden_dim=config.hidden_dim,
         num_recursions=config.num_recursions,
-        num_slots=config.num_slots,
         dropout=config.dropout,
         use_pretrained_encoder=config.use_pretrained_encoder,
         freeze_backbone=config.freeze_backbone,
@@ -1553,7 +1522,6 @@ def optuna_random_search(
             text_encoder_name=trial.suggest_categorical('text_encoder_name', search_space.text_encoder_name),
             train_text_encoder=trial.suggest_categorical('train_text_encoder', search_space.train_text_encoder),
             text_dropout=trial.suggest_categorical('text_dropout', search_space.text_dropout),
-            num_slots=trial.suggest_categorical('num_slots', search_space.num_slots),
             grad_clip=1.0,
             save_path=f"optuna_trial_{trial.number}.pt"
         )
@@ -1637,7 +1605,7 @@ def train_final_model(
     final_config = replace(
         base_config,
         epochs=final_epochs,
-        save_path='final_model.pt',
+        save_path='models/final_model_old.pt',
         early_stop_patience=base_config.early_stop_patience or 10,
         sched_T0=base_config.sched_T0 or max(1, final_epochs // 5)
     )
@@ -1909,7 +1877,6 @@ def generate_evaluation_report(results_dict, output_path):
 # %%
 def main_pipeline(
     data_path: str = 'dataset/libero_spatial',
-    work_dir: str = 'trm_robotics',
     quick_search: bool = True,
     train_final: bool = True,
     use_custom_final_config: bool = False,
@@ -1921,7 +1888,6 @@ def main_pipeline(
     
     Args:
         data_path: path ai dati LIBERO
-        work_dir: directory di lavoro
         quick_search: se True, esegue hyperparameter search
         train_final: se True, esegue training finale
         evaluate: se True, esegue valutazione in simulazione
@@ -1939,10 +1905,6 @@ def main_pipeline(
     3. Valutazione in simulazione con metriche quantitative e qualitative
     
     """)
-    
-    # Setup directories
-    os.makedirs(work_dir, exist_ok=True)
-    os.chdir(work_dir)
     
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -2024,7 +1986,6 @@ def main_pipeline(
     # ========== STEP 2: Hyperparameter Search ==========
     best_config = None
     
-    quick_search = False
     if quick_search:
         print(f"\n{'='*80}")
         print("STEP 2: Hyperparameter Search")
@@ -2054,22 +2015,17 @@ def main_pipeline(
         
         if best_config is None or use_custom_final_config:
             best_config = TrainingConfig(
-                lr=1e-4,
-                hidden_dim=128,
-                num_recursions=12,
+                lr=0.0002,
+                hidden_dim=512,
+                num_recursions=10,
                 batch_size=256,
-                epochs=20,
-                weight_decay=1.0,
-                dropout=0.3,
+                epochs=30,
+                weight_decay=0.1,
+                dropout=0.1,
                 encoder_dropout=0.1,
                 use_pretrained_encoder=True,
                 freeze_backbone=False,
-                augmentation=True,
-                text_encoder_name='openai/clip-vit-large-patch14',
-                train_text_encoder = False,
-                text_dropout = 0.1,
-                use_text_prompts = True,
-                num_slots = 4
+                augmentation=True
             )
             print("⚠️  Usando configurazione custom di default")
 
@@ -2079,7 +2035,7 @@ def main_pipeline(
             val_dataset,
             loader_common,
             device,
-            final_epochs=100,
+            final_epochs=30,
             use_wandb=use_wandb
         )
     
@@ -2102,8 +2058,7 @@ def main_pipeline(
                     obs_shape=(3, 128, 128),
                     action_dim=7,
                     hidden_dim=256,
-                    num_recursions=8,
-                    num_slots=4
+                    num_recursions=8
                 )
 
             trained_model.load_state_dict(checkpoint['model_state_dict'])
@@ -2144,132 +2099,230 @@ def main_pipeline(
     print(f"\n{'='*80}")
     print("✅ Pipeline completata!")
     print(f"{'='*80}")
-    print(f"\nFile generati in: {work_dir}")
     print("  - final_model.pt: modello allenato")
     print("  - action_stats.json: statistiche azioni")
     print("  - hyperparam_results.json: risultati hyperparameter search")
 
 # %%
+main_pipeline(quick_search=False, train_final=False, evaluate=False, use_wandb=False)
 
+# %% [markdown]
+# # Evaluation
 
 # %%
-"""Esegue Optuna HPO (incluso il text-encoder) e avvia il training finale."""
+!git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git 
+
+# %%
+!echo n | python LIBERO/benchmark_scripts/download_libero_datasets.py --datasets libero_spatial --use-huggingface
+
+# %%
+import sys
+import numpy as np
+from unittest.mock import MagicMock
+from dataclasses import fields, dataclass
+from typing import Any, Dict, List, Callable, Optional, Tuple
 import torch
+import json
+import os
+from pathlib import Path
 
-data_path = 'dataset/libero_spatial'
-work_dir = 'trm_robotics'
+# --- 1. MONKEY PATCH (CRITICAL FIX) ---
+# FIX: Mock di Matplotlib per prevenire il kernel crash dovuto a conflitti di NumPy/ABI.
+mock_mpl = MagicMock()
+sys.modules["matplotlib"] = mock_mpl
+sys.modules["matplotlib.pyplot"] = mock_mpl
+sys.modules["matplotlib.cm"] = mock_mpl
+sys.modules["matplotlib.colors"] = mock_mpl
+sys.modules["matplotlib.transforms"] = mock_mpl
+sys.modules["matplotlib.ticker"] = mock_mpl
+sys.modules["matplotlib._path"] = mock_mpl
+# --------------------------------------
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"✓ Using device: {device}\n")
+# --- SETUP PATHS ---
+LIBERO_REPO_ROOT = Path('LIBERO')
+if LIBERO_REPO_ROOT.exists() and str(LIBERO_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(LIBERO_REPO_ROOT))
 
-# ========== STEP 1: Caricamento Dataset ==========
-print(f"\n{'='*80}")
-print("STEP 1: Caricamento Dataset")
-print(f"{'='*80}")
+# Fix for Numba
+try:
+    from robosuite.utils.numba import jit_decorator
+except Exception:
+    pass
 
-data_path = Path(data_path)
-hdf5_files = list(data_path.glob('**/*.hdf5'))
+# Now these imports will work because matplotlib is mocked
+from libero.libero import get_libero_path
+from libero.libero.benchmark import get_benchmark
+from libero.libero.envs import OffScreenRenderEnv
+from libero.libero.utils.time_utils import Timer
+from libero.libero.utils.video_utils import VideoWriter
 
-if not hdf5_files:
-    raise RuntimeError(f"❌ Nessun file HDF5 trovato in {data_path}. Scarica prima il dataset LIBERO.")
-
-print(f"✓ Trovati {len(hdf5_files)} file HDF5 (task)")
-
-demo_split_ratio = 0.8
-print(f"\n📊 Demo-level split: {demo_split_ratio:.0%} train / {1-demo_split_ratio:.0%} val per ogni task")
-print(f"   Tutti i {len(hdf5_files)} task presenti in entrambi train e val")
-
-print("\nCreating TRAIN dataset...")
-train_dataset = LIBERODataset(
-    hdf5_files,
-    sequence_length=1,
-    image_size=(128, 128),
-    augmentation=False,
-    max_demos_per_task=50,
-    demo_split_ratio=demo_split_ratio,
-    is_train=True
-)
-
-train_action_stats = train_dataset.action_stats
-
-print("\nCreating VAL dataset...")
-val_dataset = LIBERODataset(
-    hdf5_files,
-    sequence_length=1,
-    image_size=(128, 128),
-    augmentation=False,
-    max_demos_per_task=50,
-    demo_split_ratio=demo_split_ratio,
-    is_train=False,
-    action_stats=train_action_stats
-)
-
-num_workers = min(4, os.cpu_count() or 1)
-use_cuda = torch.cuda.is_available()
-
-loader_common = {
-    'num_workers': num_workers,
-    'pin_memory': use_cuda,
-    'persistent_workers': num_workers > 0
+# --- CLASSI E FUNZIONI AUSILIARIE (assumendo siano corrette) ---
+benchmark_map = {
+    'libero_10': 'LIBERO_10', 'libero_spatial': 'LIBERO_SPATIAL', 
+    'libero_object': 'LIBERO_OBJECT', 'libero_goal': 'LIBERO_GOAL'
 }
-if num_workers > 0:
-    loader_common['prefetch_factor'] = 2
 
-print(f"\n✓ Dataset creati con demo-level split")
-print(f"  Train samples: {len(train_dataset)}")
-print(f"  Val samples: {len(val_dataset)}")
+# La tua classe TrainingConfig (definita in una cella precedente)
+@dataclass
+class TrainingConfig:
+    lr=0.0002,
+    hidden_dim=512,
+    num_recursions=16,
+    batch_size=256,
+    epochs=30,
+    weight_decay=0.1,
+    dropout=0.1,
+    encoder_dropout=0.1,
+    use_pretrained_encoder=True,
+    freeze_backbone=False,
+    augmentation=False
 
-action_stats = train_dataset.action_stats
-with open('action_stats.json', 'w') as f:
-    json.dump({
-        'mean': action_stats['mean'].tolist(),
-        'std': action_stats['std'].tolist()
-    }, f)
+    def to_dict(self): return {f.name: getattr(self, f.name) for f in fields(self)}
+    def label(self): return f"lr{self.lr}_h{self.hidden_dim}_rec{self.num_recursions}"
 
-# ========== STEP 2: Hyperparameter Search con Optuna ==========
-search_trials = 20
-quick_epochs = 5
-print(f"\n{'='*80}")
-print(f"STEP 2: Optuna search ({search_trials} trials, {quick_epochs} quick epochs)")
-print(f"{'='*80}")
 
-best_config, search_history = optuna_random_search(
-    train_dataset,
-    val_dataset,
-    loader_common,
-    device,
-    quick_epochs=quick_epochs,
-    search_space=default_search_space(),
-    n_trials=search_trials
-)
+def _merge_training_config(stored: Dict[str, Any]) -> TrainingConfig:
+    class ConfigObj:
+        def __init__(self, **entries): self.__dict__.update(entries)
+    return ConfigObj(**stored)
 
-with open('hyperparam_results.json', 'w') as f:
-    json.dump(search_history, f, indent=2)
+def _stack_vector_obs(obs: Any) -> Dict[str, np.ndarray]:
+    if isinstance(obs, list):
+        keys = obs[0].keys()
+        return {k: np.stack([o[k] for o in obs], axis=0) for k in keys}
+    return obs
 
-with open('best_hyperparams.json', 'w') as f:
-    json.dump(best_config.to_dict(), f, indent=2)
+def _select_camera_key(obs_batch: Dict[str, np.ndarray]) -> str:
+    for key in ('agentview_rgb', 'agentview_image', 'robot0_agentview_image'):
+        if key in obs_batch: return key
+    return list(obs_batch.keys())[0]
 
-print("\n✅ Optuna search completata. Miglior configurazione:")
-print(best_config.to_dict())
+def _resolve_task_prompt(task) -> str:
+    """Estrae una descrizione testuale consistente dal task LIBERO."""
+    print(task)
+    prompt = task.bddl_file.replace('_', ' ').replace('.bddl', '').strip().strip('"')
+    return prompt
 
-# ========== STEP 3: Training con la miglior configurazione ==========
-final_config = replace(
-    best_config,
-    epochs=10,
-    save_path='optuna_best.pt'
-)
+def _prepare_policy_input(images: np.ndarray, device: torch.device) -> torch.Tensor:
+    imgs = torch.from_numpy(images).to(device=device, dtype=torch.float32) / 255.0
+    return imgs.permute(0, 3, 1, 2).contiguous()
 
-train_loader, val_loader = build_dataloaders(train_dataset, val_dataset, final_config.batch_size, loader_common)
-model = build_policy_from_config(final_config, obs_shape=(3, 128, 128)).to(device)
-trainer = BehaviorCloningTrainer(model, train_loader, val_loader, final_config, device, use_wandb=False)
+class SequentialVectorEnv:
+    def __init__(self, env_fns: List[Callable]):
+        self.envs = [fn() for fn in env_fns]
+    def step(self, actions):
+        results = [env.step(a) for env, a in zip(self.envs, actions)]
+        obs_list, rews_list, dones_list, infos_list = zip(*results)
+        return list(obs_list), np.array(rews_list), np.array(dones_list), list(infos_list)
+    def reset(self):
+        return [env.reset() for env in self.envs]
+    def seed(self, seed):
+        for i, env in enumerate(self.envs):
+            if hasattr(env, 'seed'):
+                env.seed(seed + i)
+    def set_init_state(self, states):
+        return [env.set_init_state(s) for env, s in zip(self.envs, states)]
+    def close(self):
+        for env in self.envs:
+            env.close()
 
-print('\nRunning validation before training...')
-val_metrics = trainer._validate_epoch(0)
-print(f"Initial validation loss: {val_metrics['loss']:.4f}")
+# %%
+# --- EVALUATION FUNCTION (FIXED) ---
+def evaluate_model(
+    checkpoint_path: str = 'models/final_model_old.pt',
+    action_stats_path: str = 'action_stats.json',
+    benchmark: str = 'libero_spatial',
+    task_id: int = 6,
+    env_num: int = 3,
+    max_steps: int = 800,
+    seed: int = 42,
+    save_videos: bool = True,
+    video_dir: str = 'evaluation_videos',
+    camera_height: int = 128,
+    camera_width: int = 128,
+    video_skip: int = 1
+) -> Dict[str, Any]:
+    print(f"Starting evaluation on {benchmark} Task {task_id} (Parallel Envs: {env_num}, Max Steps: {max_steps})...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-print('Starting final training with Optuna config...')
-best_val = trainer.train()
-print(f"Training finished. Best validation loss saved: {best_val:.4f}")
-print(f"Checkpoint saved to: {final_config.save_path}")
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    cfg = _merge_training_config(ckpt.get('config', {}))
+    policy = build_policy_from_config(cfg, obs_shape=(3, camera_height, camera_width)).to(device)
+    policy.load_state_dict(ckpt['model_state_dict'])
+    policy.eval()
+
+    stats = json.load(open(action_stats_path))
+    action_mean = torch.tensor(stats['mean'], device=device).unsqueeze(0)
+    action_std = torch.tensor(stats['std'], device=device).unsqueeze(0)
+    action_dim = int(action_mean.shape[-1])
+
+    benchmark_map = {'libero_10': 'LIBERO_10', 'libero_spatial': 'LIBERO_SPATIAL'}
+    suite = get_benchmark(benchmark_map.get(benchmark, benchmark))(0)
+    task = suite.get_task(task_id)
+    task_prompt = task.language
+    use_prompts = getattr(policy, 'use_text_prompts', False)
+    if use_prompts:
+        print(f"Using language prompt: '{task_prompt}'")
+
+    env_args = {
+        'bddl_file_name': str(Path(get_libero_path('bddl_files')) / task.problem_folder / task.bddl_file),
+        'camera_heights': camera_height,
+        'camera_widths': camera_width
+    }
+    env = SequentialVectorEnv([lambda: OffScreenRenderEnv(**env_args) for _ in range(env_num)])
+
+    try:
+        init_states = torch.load(str(Path(get_libero_path('init_states')) / task.problem_folder / task.init_states_file), map_location='cpu', weights_only=False)
+        obs = env.reset()
+        env.seed(seed)
+        env.set_init_state(init_states[0:env_num])
+
+        dones = [False] * env_num
+        successes = np.zeros(env_num, dtype=bool)
+
+        with VideoWriter(video_dir, save_videos) as video_writer:
+            for step in range(max_steps):
+                obs_batch = _stack_vector_obs(obs)
+                cam_key = _select_camera_key(obs_batch)
+
+                alive = [i for i, d in enumerate(dones) if not d]
+                if not alive:
+                    break
+
+                vis_batch = obs_batch[cam_key][alive]
+                p_in = _prepare_policy_input(vis_batch, device)
+
+                with torch.no_grad():
+                    prompt_batch = [task_prompt for _ in alive] if use_prompts else None
+                    actions_alive = policy(p_in, prompt_batch)
+                    actions_alive = actions_alive * action_std + action_mean
+                    full_actions = np.zeros((env_num, action_dim), dtype=np.float32)
+                    full_actions[alive] = actions_alive.detach().cpu().numpy().astype(np.float32)
+
+                obs, reward, done_batch, info = env.step(full_actions)
+                
+                for i in alive:
+                    if reward[i] != 0.0:
+                        successes[i] = True
+                        print(f"✓ Success detected for env {i} at step {step}, reward = {reward[i]}")
+                    dones[i] = dones[i] or bool(done_batch[i])
+                
+                if save_videos and step % video_skip == 0:
+                    video_writer.append_vector_obs(obs, dones, camera_name=cam_key)
+
+        success_rate = float(successes.mean())
+        print(f"\n📊 Final Results: {successes.sum()}/{env_num} successes")
+        results = {
+            'success_rate': success_rate,
+            'episodes': int(env_num),
+            'max_steps': int(max_steps)
+        }
+    finally:
+        env.close()
+
+    return results
+
+# %%
+evaluate_model()
 
 
